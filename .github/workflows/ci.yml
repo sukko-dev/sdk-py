@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: "Run the opt-in live-compose integration suite"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ruff check src tests examples
+      - run: ruff format --check src tests examples
+
+  typecheck:
+    name: mypy --strict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: mypy --strict src
+
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: pytest -q
+
+  # Opt-in live-compose smoke — booted with an Enterprise license (cumulative: covers the
+  # Pro-gated publish/SSE and Enterprise-gated push suites) and MESSAGE_BACKEND=kafka (the
+  # replay leg needs a Kafka backend). Gated on a manual dispatch input so ordinary
+  # CI stays fast and hermetic. The suite lives in tests/integration/ and connects to a real
+  # gateway via SUKKO_IT_* env; booting the compose stack + issuing the Enterprise token is the
+  # operator's part (a self-hosted runner or a compose service step wired to the `sukko` repo).
+  integration:
+    name: Integration (live compose)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_integration == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - name: Run live integration suite
+        env:
+          SUKKO_IT_WS_URL: ${{ secrets.SUKKO_IT_WS_URL }}
+          SUKKO_IT_TOKEN: ${{ secrets.SUKKO_IT_TOKEN }}
+          SUKKO_IT_CHANNEL: ${{ vars.SUKKO_IT_CHANNEL }}
+        run: pytest -q -m integration tests/integration

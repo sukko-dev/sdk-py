@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Local lint gate — mirrors the CI lint job (ruff check + format) so drift is
+# caught before the commit, not on the PR. mypy --strict stays CI-only (slower;
+# run it manually with `mypy --strict src` when touching types). Install once:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+# Prefer the project venv's ruff; fall back to PATH (CI, alternative setups).
+RUFF="ruff"
+[ -x .venv/bin/ruff ] && RUFF=".venv/bin/ruff"
+
+echo "pre-commit: ruff check"
+"$RUFF" check src tests examples
+
+echo "pre-commit: ruff format --check"
+"$RUFF" format --check src tests examples

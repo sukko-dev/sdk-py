@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sukko"
+version = "0.1.0"
+description = "Asyncio-first Python client SDK for the Sukko real-time platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sukko Contributors" }]
+keywords = ["websocket", "realtime", "sse", "market-data", "pubsub", "sukko"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "websockets>=13",
+    "httpx>=0.27",
+    "msgspec>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pyyaml>=6",          # contract-coverage parse of the AsyncAPI yaml
+    "build>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/sukko-dev/sdk-py"
+Repository = "https://github.com/sukko-dev/sdk-py"
+Changelog = "https://github.com/sukko-dev/sdk-py/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sukko"]
+
+# py.typed is shipped via package inclusion (it lives inside src/sukko/).
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pyflakes / pycodestyle
+    "I",             # isort
+    "UP",            # pyupgrade
+    "B",             # bugbear
+    "ASYNC",         # flake8-async
+    "SIM",           # flake8-simplify
+    "RUF",           # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+"src/sukko/__init__.py" = ["RUF022"]  # __all__ is grouped by concern (readability) not alphabetized
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Default run is hermetic: the opt-in live-compose suite (marked `integration`) is excluded unless
+# selected explicitly with `-m integration`.
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: opt-in tests against a live compose stack (Enterprise license + MESSAGE_BACKEND=kafka)",
+]

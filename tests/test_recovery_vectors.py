@@ -48,11 +48,19 @@ def _canonical(action: Action) -> dict[str, Any]:
     if isinstance(action, SendReplay):
         return {"action": "send_replay", "channel": action.channel, "from_pos": action.from_pos}
     if isinstance(action, SendReconnect):
-        return {"action": "send_reconnect", "client_id": action.client_id, "last_pos": action.last_pos}
+        return {
+            "action": "send_reconnect",
+            "client_id": action.client_id,
+            "last_pos": action.last_pos,
+        }
     if isinstance(action, EmitPossibleGap):
         return {"action": "emit_possible_gap", "channel": action.channel}
     if isinstance(action, RaiseRecoveryInterrupted):
-        return {"action": "raise_recovery_interrupted", "channel": action.channel, "reason": action.reason}
+        return {
+            "action": "raise_recovery_interrupted",
+            "channel": action.channel,
+            "reason": action.reason,
+        }
     raise AssertionError(f"unhandled recovery action: {action!r}")
 
 

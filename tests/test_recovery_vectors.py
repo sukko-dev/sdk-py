@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from sukko.recovery import (
     Action,
     EmitPossibleGap,
@@ -90,7 +92,13 @@ def _run(scenario: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def test_recovery_gap_replay_basic() -> None:
-    scenario = json.loads((VECTORS_DIR / "recovery" / "gap-replay-basic.json").read_text())
+_RECOVERY_VECTORS = sorted((VECTORS_DIR / "recovery").glob("*.json"))
+
+
+@pytest.mark.parametrize("vector_path", _RECOVERY_VECTORS, ids=lambda p: p.name)
+def test_recovery_vector(vector_path) -> None:
+    # Every vendored recovery vector replays through the real RecoveryEngine and must produce the
+    # scenario's canonical actions — adding a scenario is one JSON file (vendored), no test change.
+    scenario = json.loads(vector_path.read_text())
     assert scenario["machine"] == "recovery"
     assert _run(scenario) == scenario["expect"]

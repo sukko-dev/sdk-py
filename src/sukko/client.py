@@ -487,9 +487,9 @@ class SukkoClient:
                 self._recovery.note_replay_message(message.channel)
             elif message.history:
                 self._recovery.note_history_message(message.channel)
-            await self._queue.put(message)
+            await self._put_delivery(message)
         elif isinstance(message, Gap):
-            await self._queue.put(message)  # surface the loss signal to the consumer too
+            await self._put_delivery(message)  # surface the loss signal to the consumer too
             await self._run_actions(
                 transport, self._recovery.handle_gap(message.channel, message.last_pos)
             )
@@ -549,6 +549,23 @@ class SukkoClient:
             )
         # ReconnectAck / Pong: liveness already recorded; nothing more to do.
 
+    async def _put_delivery(self, item: DeliveredItem) -> None:
+        """Enqueue a delivery item, signalling recovery back-pressure while the put actually BLOCKS
+        (a full pausable queue). The blocking put IS the pause here, so the recovery detection
+        deadline suspends while stalled and a slow consumer is not mistaken for server silence
+        (platform ADR-0025). No signal when the put would not block — so the pause-episode counter
+        only advances on genuine back-pressure, never on ordinary delivery. Single-producer: every
+        caller runs on the read-pump task, which is what makes the is_full check-then-put atomic and
+        the un-refcounted paused flag safe."""
+        if self._queue.is_full:
+            self._recovery.note_backpressure(True)
+            try:
+                await self._queue.put(item)
+            finally:
+                self._recovery.note_backpressure(False)
+        else:
+            await self._queue.put(item)
+
     async def _run_actions(self, transport: Transport, actions: list[Action]) -> None:
         for action in actions:
             if isinstance(action, SendReplay):
@@ -564,7 +581,7 @@ class SukkoClient:
                     ),
                 )
             elif isinstance(action, EmitPossibleGap):
-                await self._queue.put(PossibleGap(channel=action.channel))
+                await self._put_delivery(PossibleGap(channel=action.channel))
             elif isinstance(action, RaiseRecoveryInterrupted):
                 self._emit_error(RecoveryInterruptedError(action.reason, channel=action.channel))
 

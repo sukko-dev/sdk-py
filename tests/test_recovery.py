@@ -136,3 +136,51 @@ def test_disconnect_preserves_pos_for_next_reconnect() -> None:
     eng.note_pos("acme.a", "2-9")
     eng.handle_disconnect()
     assert eng.build_reconnect() == SendReconnect(client_id="c1", last_pos={"acme.a": "2-9"})
+
+
+async def test_replay_deadline_suspended_while_backpressured() -> None:
+    # The detection deadline detects SERVER silence, not consumer speed (platform ADR-0025). While
+    # the consumer is backpressured, recovery frames stop, so a full window with no frame must
+    # SUSPEND the deadline (re-arm), not fire — the silence is the consumer's. After resume, a
+    # genuinely silent window does interrupt.
+    clock = FakeClock(start=0.0)
+    eng = RecoveryEngine(clock=clock)
+    eng.handle_gap("acme.a", "p1")  # REPLAYING, deadline at t=10
+    eng.note_backpressure(True)
+    await clock.advance(10.0)
+    assert eng.due() == []  # suspended
+    eng.note_backpressure(False)
+    await clock.advance(10.0)
+    assert eng.due() == [
+        RaiseRecoveryInterrupted("acme.a", "no replay_complete before detection deadline")
+    ]
+
+
+async def test_replay_deadline_suspended_by_backpressure_episode() -> None:
+    # A back-pressure episode that opens AND closes within one window still suspends it — point-
+    # sampling "paused now" would miss it, the pause-episode counter does not.
+    clock = FakeClock(start=0.0)
+    eng = RecoveryEngine(clock=clock)
+    eng.handle_gap("acme.a", "p1")  # deadline at t=10, arm_pause_episodes=0
+    eng.note_backpressure(True)
+    eng.note_backpressure(False)  # episode opened+closed; paused False now
+    await clock.advance(10.0)
+    assert eng.due() == []  # an episode occurred since arm → suspend
+    await clock.advance(10.0)  # a clean window, no new episode
+    assert eng.due() == [
+        RaiseRecoveryInterrupted("acme.a", "no replay_complete before detection deadline")
+    ]
+
+
+async def test_history_deadline_suspended_while_backpressured() -> None:
+    clock = FakeClock(start=0.0)
+    eng = RecoveryEngine(clock=clock)
+    eng.note_history_request("acme.a")  # history deadline at t=10
+    eng.note_backpressure(True)
+    await clock.advance(10.0)
+    assert eng.due() == []  # suspended, not interrupted
+    eng.note_backpressure(False)
+    await clock.advance(10.0)
+    assert eng.due() == [
+        RaiseRecoveryInterrupted("acme.a", "no history_complete before detection deadline")
+    ]

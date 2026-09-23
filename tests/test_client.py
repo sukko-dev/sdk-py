@@ -431,3 +431,51 @@ async def test_rest_publish_and_push_through_client_without_connect() -> None:
     assert await client.push.get_vapid_key() == "vapid"
     await client.close()  # REST-only close path
     assert client.state is ConnectionState.DISCONNECTED
+
+
+async def test_recovery_deadline_suspended_while_consumer_backpressured() -> None:
+    """Client-level wiring: while the delivery consumer is backpressured (the blocking put stalls
+    the read-pump so recovery frames stop), the recovery detection deadline must SUSPEND, not fire —
+    the client signals note_backpressure into the blocking put (platform ADR-0025). Guards that
+    wiring: deleting the note_backpressure(True) call makes the timer raise a spurious
+    RecoveryInterrupted here."""
+    errors: list[SukkoError] = []
+    clock = FakeClock(start=0.0)
+    server = FakeServer()
+    server.enable_auto_ack()
+    client = _make_client(server, clock=clock, on_error=errors.append, queue_maxsize=200)
+    await client.connect()
+    await client.subscribe(["acme.a"])
+    await _drain()
+
+    server.push(
+        Gap(channel="acme.a", from_seq=1, to_seq=2, last_pos="2-9", ts=0)
+    )  # → REPLAYING, deadline at +10s
+    await _drain()
+    # Fill the queue past capacity with no messages() consumer → the read-pump's put blocks
+    # (back-pressure), so recovery frames stop and the client signals note_backpressure(True).
+    for i in range(250):
+        server.push(Message(seq=i, ts=0, channel="acme.a", data={}))
+    await _drain()
+
+    await clock.advance(11.0)  # a full detection-deadline window elapses while backpressured
+    await _drain()
+    assert not any(isinstance(e, RecoveryInterruptedError) for e in errors)  # suspended, not fired
+
+    # RESUME: consume the queue so every blocked put completes — back-pressure clears and the
+    # client must signal note_backpressure(False). Then a full window with no recovery frame MUST
+    # interrupt; else the engine stays paused forever and no deadline fires again (a silent wedge).
+    stream = client.messages()
+    while True:  # real-time drain until the pump goes quiet (all blocked puts released)
+        try:
+            await asyncio.wait_for(stream.__anext__(), timeout=0.05)
+        except TimeoutError:
+            break
+    # A back-pressure episode occurred during the stall, so the first resumed window re-arms the
+    # deadline (episode count changed since arm); the next clean window fires.
+    await clock.advance(11.0)
+    await _drain()
+    await clock.advance(11.0)
+    await _drain()
+    assert any(isinstance(e, RecoveryInterruptedError) for e in errors)  # fires after resume
+    await client.close()

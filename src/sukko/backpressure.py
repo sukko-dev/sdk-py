@@ -67,6 +67,12 @@ class DeliveryQueue:
     def qsize(self) -> int:
         return self._queue.qsize()
 
+    @property
+    def is_full(self) -> bool:
+        """True when a put would BLOCK — i.e. a pausable transport whose bounded queue is at
+        capacity. On a non-pausable transport a put never blocks (overflow policy), so False."""
+        return self._can_pause and self._queue.full()
+
     async def put(self, item: DeliveredItem) -> None:
         """Enqueue ``item``. On a pausable transport this **blocks when full** (the back-pressure
         signal). On a non-pausable transport it applies the overflow policy and records the loss."""

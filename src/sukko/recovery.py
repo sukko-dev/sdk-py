@@ -80,6 +80,9 @@ class _Channel:
     last_replay_at: float = float("-inf")  # for the 1/floor-per-channel rate limit
     floor_wake: float | None = None  # absolute time FLOOR_WAIT may fire
     deadline: float | None = None  # absolute "no replay_complete by now" detection deadline
+    arm_pause_episodes: int = (
+        0  # _pause_episodes captured when `deadline` was armed (silence baseline)
+    )
 
 
 class RecoveryEngine:
@@ -103,7 +106,13 @@ class RecoveryEngine:
         self._channels: dict[str, _Channel] = {}
         self._direct = False  # flipped to True once the backend reports not_available
         self._connected_once = False  # set on first connect → later reconnects probe for Direct
-        self._history_deadline: dict[str, float] = {}
+        self._history_deadline: dict[
+            str, tuple[float, int]
+        ] = {}  # channel -> (deadline, arm_pause_episodes)
+        self._paused = False
+        self._pause_episodes = (
+            0  # monotonic; a False->True transition opens a back-pressure episode
+        )
 
     # --- pos tracking -------------------------------------------------------------------------
 
@@ -152,7 +161,25 @@ class RecoveryEngine:
         rec.last_replay_at = now
         rec.floor_wake = None
         rec.deadline = now + self._deadline
+        rec.arm_pause_episodes = self._pause_episodes
         return SendReplay(channel=channel, from_pos=from_pos)
+
+    def note_backpressure(self, paused: bool) -> None:
+        """The delivery consumer stalled (``True``) or resumed (``False``). While stalled,
+        recovery frames stop arriving, so a detection deadline **suspends** rather than fires:
+        the silence is the consumer's, not the server's (platform ADR-0025; the Py half of Go's
+        park-suspension). A ``False``->``True`` transition opens a back-pressure **episode**, so a
+        stall that opens and closes entirely within one deadline window still suspends that window
+        (point-sampling ``_paused`` alone would miss it)."""
+        if paused and not self._paused:
+            self._pause_episodes += 1
+        self._paused = paused
+
+    def _backpressure_suspends(self, arm_pause_episodes: int) -> bool:
+        """True when the deadline's silence is the consumer's: currently backpressured, or a
+        back-pressure episode opened since the deadline was armed (mirrors Go's parked-now ||
+        episodes-changed suspension)."""
+        return self._paused or self._pause_episodes != arm_pause_episodes
 
     def handle_replay_complete(self, channel: str) -> list[Action]:
         """A ``replay_complete`` arrived. If a gap landed mid-replay, start the follow-up cycle
@@ -182,6 +209,7 @@ class RecoveryEngine:
         rec = self._channels.get(channel)
         if rec is not None and rec.phase is _Phase.REPLAYING:
             rec.deadline = self._clock.monotonic() + self._deadline
+            rec.arm_pause_episodes = self._pause_episodes
 
     # --- clock-driven timers ------------------------------------------------------------------
 
@@ -199,22 +227,31 @@ class RecoveryEngine:
             ):
                 actions.append(self._begin_replay(rec, channel, rec.anchor, now))
             elif rec.phase is _Phase.REPLAYING and rec.deadline is not None and now >= rec.deadline:
-                rec.phase = _Phase.IDLE
-                rec.deadline = None
-                rec.followup_anchor = None  # reset fully, matching the other failure paths
-                actions.append(
-                    RaiseRecoveryInterrupted(
-                        channel, "no replay_complete before detection deadline"
+                if self._backpressure_suspends(rec.arm_pause_episodes):
+                    # Consumer stall, not server silence — re-arm, don't fire (platform ADR-0025).
+                    rec.deadline = now + self._deadline
+                    rec.arm_pause_episodes = self._pause_episodes
+                else:
+                    rec.phase = _Phase.IDLE
+                    rec.deadline = None
+                    rec.followup_anchor = None  # reset fully, matching the other failure paths
+                    actions.append(
+                        RaiseRecoveryInterrupted(
+                            channel, "no replay_complete before detection deadline"
+                        )
                     )
-                )
         for channel in list(self._history_deadline):
-            if now >= self._history_deadline[channel]:
-                del self._history_deadline[channel]
-                actions.append(
-                    RaiseRecoveryInterrupted(
-                        channel, "no history_complete before detection deadline"
+            deadline, arm = self._history_deadline[channel]
+            if now >= deadline:
+                if self._backpressure_suspends(arm):
+                    self._history_deadline[channel] = (now + self._deadline, self._pause_episodes)
+                else:
+                    del self._history_deadline[channel]
+                    actions.append(
+                        RaiseRecoveryInterrupted(
+                            channel, "no history_complete before detection deadline"
+                        )
                     )
-                )
         return actions
 
     def next_deadline(self) -> float | None:
@@ -225,20 +262,26 @@ class RecoveryEngine:
             for t in (rec.floor_wake if rec.phase is _Phase.FLOOR_WAIT else None, rec.deadline)
             if t is not None
         ]
-        times.extend(self._history_deadline.values())
+        times.extend(deadline for deadline, _arm in self._history_deadline.values())
         return min(times) if times else None
 
     # --- history ------------------------------------------------------------------------------
 
     def note_history_request(self, channel: str) -> None:
         """Arm the detection deadline for an in-flight history request on ``channel``."""
-        self._history_deadline[channel] = self._clock.monotonic() + self._deadline
+        self._history_deadline[channel] = (
+            self._clock.monotonic() + self._deadline,
+            self._pause_episodes,
+        )
 
     def note_history_message(self, channel: str) -> None:
         """A history ``message`` arrived — reset that channel's idle history deadline (server
         silence, not consumer speed). No-op unless a history request is in flight."""
         if channel in self._history_deadline:
-            self._history_deadline[channel] = self._clock.monotonic() + self._deadline
+            self._history_deadline[channel] = (
+                self._clock.monotonic() + self._deadline,
+                self._pause_episodes,
+            )
 
     def handle_history_complete(self, channel: str) -> None:
         self._history_deadline.pop(channel, None)

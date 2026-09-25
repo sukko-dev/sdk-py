@@ -75,6 +75,9 @@ def _run(scenario: dict[str, Any]) -> list[dict[str, Any]]:
         if "advance" in step:
             clock.advance_ms(step["advance"])
             actions = engine.due()
+        elif "backpressure" in step:
+            engine.note_backpressure(step["backpressure"])
+            actions = []
         else:
             event = step["event"]
             if event == "gap":

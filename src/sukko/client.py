@@ -282,15 +282,20 @@ class SukkoClient:
     async def unsubscribe(self, channels: Sequence[str]) -> None:
         chans = list(channels)
         transport = self._transport
-        live = transport is not None and self._state is ConnectionState.CONNECTED
-        if live and transport.capabilities.can_subscribe:
-            await self._send(transport, Unsubscribe(data=UnsubscribeData(channels=chans)))
+        if transport is not None and self._state is ConnectionState.CONNECTED:
+            if transport.capabilities.can_subscribe:
+                await self._send(transport, Unsubscribe(data=UnsubscribeData(channels=chans)))
+                self._subscriptions.unwant(chans)
+                return
+            # live SSE: drop the channels, then bounce (redial with the reduced set, or park if it
+            # is now empty).
             self._subscriptions.unwant(chans)
+            self._desired_changed.set()
+            await self._bounce()
             return
+        # not live: recorded; applied on the next connect.
         self._subscriptions.unwant(chans)
         self._desired_changed.set()
-        if live:  # live SSE: redial with the reduced set (or park if it is now empty)
-            await self._bounce()
 
     async def _bounce(self) -> None:
         """Close the live SSE epoch so the supervisor redials with the current desired set. The

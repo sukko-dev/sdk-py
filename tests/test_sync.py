@@ -30,7 +30,7 @@ def _server_that_delivers_on_subscribe() -> FakeServer:
 
 
 def _sync_client(server: FakeServer) -> SyncSukkoClient:
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     return SyncSukkoClient("ws://test", transport_factory=factory)
@@ -67,7 +67,7 @@ async def test_sync_client_within_a_running_loop() -> None:
 def test_sync_context_manager() -> None:
     server = _server_that_delivers_on_subscribe()
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     with SyncSukkoClient("ws://test", transport_factory=factory) as client:
@@ -79,7 +79,7 @@ def test_sync_context_manager() -> None:
 def test_sync_close_idempotent_and_without_connect() -> None:
     server = _server_that_delivers_on_subscribe()
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     client = SyncSukkoClient("ws://test", transport_factory=factory)

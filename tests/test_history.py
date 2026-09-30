@@ -20,7 +20,7 @@ async def _drain(times: int = 6) -> None:
 
 
 def _client(server: FakeServer, **kwargs: object) -> SukkoClient:
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     return SukkoClient("ws://test", transport_factory=factory, **kwargs)  # type: ignore[arg-type]

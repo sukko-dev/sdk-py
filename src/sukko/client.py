@@ -97,9 +97,14 @@ logger = logging.getLogger("sukko.client")
 
 _P = ParamSpec("_P")
 
-#: Builds a fresh transport for a connection epoch, given the channels to resume (used by SSE's
-#: connect-time ``channels``; the WebSocket factory ignores them and subscribes dynamically).
-TransportFactory = Callable[[Sequence[str]], Transport]
+#: Builds a fresh transport for a connection epoch, given (1) the channels to resume (used by
+#: SSE's connect-time ``channels``; the WebSocket factory ignores them and subscribes
+#: dynamically) and (2) the opaque resume cursor from the previous epoch — the last SSE event
+#: ``id`` the dropped transport saw, or ``None`` on the first connect. An SSE factory passes it
+#: as ``SseTransport(last_event_id=...)`` so the reconnect echoes ``Last-Event-ID`` and the
+#: server replays the gap; the WebSocket factory ignores it (WS resumes via its own ``last_pos``
+#: cursor). The cursor is opaque — pass it through verbatim, never parse it.
+TransportFactory = Callable[[Sequence[str], str | None], Transport]
 
 ErrorListener = Callable[[SukkoError], None]
 NotGrantedListener = Callable[[frozenset[str]], None]
@@ -350,8 +355,16 @@ class SukkoClient:
 
     async def _run(self) -> None:
         attempt = 0
+        # Opaque SSE resume cursor threaded across connection epochs: the last event id the
+        # previous epoch's transport saw, echoed as Last-Event-ID on the next connect so the
+        # server replays the gap (WHATWG EventSource model; WS ignores it and resumes via
+        # last_pos). Loop-local by design — an explicit close()+reconnect starts fresh; a caller
+        # wanting cross-restart persistence seeds it through their own factory.
+        resume_cursor: str | None = None
         while self._running():
-            transport = self._transport_factory(self._subscriptions.resume_channels())
+            transport = self._transport_factory(
+                self._subscriptions.resume_channels(), resume_cursor
+            )
             try:
                 await transport.open()
             except SukkoError as exc:
@@ -397,6 +410,12 @@ class SukkoClient:
                 terminal = any(getattr(e, "terminal", False) for e in eg.exceptions)
             finally:
                 self._transport = None
+                # Harvest the cursor this epoch reached so the next connect resumes from it.
+                # SSE-only (getattr: the Protocol doesn't declare it, WS has none); guard on
+                # not-None so a transport without a cursor never clobbers a good one.
+                harvested = getattr(transport, "last_event_id", None)
+                if harvested is not None:
+                    resume_cursor = harvested
                 await self._on_disconnected(transport)
                 with suppress(SukkoError):
                     await transport.close()
@@ -656,7 +675,12 @@ class SukkoClient:
             # supervisor (§VI). Log and continue.
             logger.exception("on_error callback raised")
 
-    def _default_transport_factory(self, channels: Sequence[str]) -> Transport:
+    def _default_transport_factory(
+        self, channels: Sequence[str], last_event_id: str | None = None
+    ) -> Transport:
+        # WebSocket is the default transport; it ignores both the SSE connect-time channels and
+        # the SSE Last-Event-ID cursor (it resumes via its own last_pos, §recovery).
+        del channels, last_event_id
         return WebSocketTransport(
             self._url,
             token=self._auth.token,

@@ -25,7 +25,7 @@ from sukko.messages import (
     Subscribe,
     SubscriptionAck,
 )
-from sukko.transport.base import ConnectionState
+from sukko.transport.base import SSE_CAPABILITIES, ConnectionState
 
 
 async def _drain(times: int = 6) -> None:
@@ -37,7 +37,7 @@ async def _drain(times: int = 6) -> None:
 def _make_client(
     server: FakeServer, *, clock: FakeClock | None = None, **kwargs: object
 ) -> SukkoClient:
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     return SukkoClient(
@@ -166,7 +166,7 @@ def _multi_epoch_client(
     """A client whose factory hands out ``servers`` one per epoch (for reconnect tests)."""
     index = [0]
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         server = servers[index[0]]
         index[0] += 1
         return FakeTransport(server)
@@ -312,7 +312,7 @@ async def test_close_does_not_raise_when_queue_is_full() -> None:
 async def test_terminal_4001_close_stops_reconnect() -> None:
     created: list[FakeTransport] = []
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         server = FakeServer()
         server.enable_auto_ack()
         transport = FakeTransport(server)
@@ -478,4 +478,59 @@ async def test_recovery_deadline_suspended_while_consumer_backpressured() -> Non
     await clock.advance(11.0)
     await _drain()
     assert any(isinstance(e, RecoveryInterruptedError) for e in errors)  # fires after resume
+    await client.close()
+
+
+async def test_sse_last_event_id_threaded_across_reconnect() -> None:
+    """The supervisor threads a dropped SSE transport's last_event_id into the NEXT epoch's
+    factory call, so the reconnect echoes Last-Event-ID and the server replays the gap (the fix:
+    Client-managed SSE reconnect was previously losing the cursor). Pins first-connect-carries-None
+    and that the cursor advances to what the prior epoch reached."""
+    calls: list[str | None] = []
+    epoch_ids = ["evt-1", "evt-2"]
+    created: list[FakeTransport] = []
+
+    def factory(_channels: Sequence[str], last_event_id: str | None = None) -> FakeTransport:
+        calls.append(last_event_id)
+        server = FakeServer()
+        transport = FakeTransport(server, capabilities=SSE_CAPABILITIES)
+        # Simulate this epoch's transport having captured an id: cursor by the time it drops.
+        idx = len(created)
+        transport.last_event_id = epoch_ids[idx] if idx < len(epoch_ids) else None
+        created.append(transport)
+        return transport
+
+    clock = FakeClock()
+    client = SukkoClient("ws://test", transport_factory=factory, clock=clock, reconnect=True)
+    await client.connect()
+    await _drain()
+    assert calls[0] is None  # first connect carries no resume cursor
+
+    # Drop epoch 1 with a non-terminal close → the supervisor backs off, then reconnects.
+    created[0].server.close_connection(CLOSE_CODES.GOING_AWAY, CloseDirection.REMOTE)
+    await _drain()
+    await clock.advance(2.0)  # elapse the reconnect backoff (full-jitter, base 1s)
+    await _drain()
+
+    assert len(created) >= 2, "expected a reconnect epoch after the non-terminal close"
+    assert calls[1] == "evt-1", "reconnect must echo the id the dropped epoch reached"
+    await client.close()
+
+
+async def test_ws_factory_ignores_resume_cursor_arg() -> None:
+    """A transport without a last_event_id (the WebSocket case) never clobbers the resume cursor:
+    the default WS factory accepts and ignores the arg, and the getattr harvest yields None so the
+    supervisor keeps whatever cursor it held."""
+    # The default factory is WebSocket; connecting proves it accepts the 2-arg call shape.
+    server = FakeServer()
+    server.enable_auto_ack()
+
+    def factory(_channels: Sequence[str], last_event_id: str | None = None) -> FakeTransport:
+        assert last_event_id is None  # first (and only) connect
+        return FakeTransport(server)  # WEBSOCKET_CAPABILITIES, no last_event_id attr
+
+    client = SukkoClient("ws://test", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.connect()
+    await _drain()
+    assert client.state is ConnectionState.CONNECTED
     await client.close()

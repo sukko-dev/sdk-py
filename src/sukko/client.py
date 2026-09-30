@@ -444,34 +444,34 @@ class SukkoClient:
                 with suppress(SukkoError):
                     await transport.close()
 
-            if not self._running() or not self._reconnect or terminal:
+            if not self._running() or terminal:
                 self._state = ConnectionState.DISCONNECTED
                 return
 
-            # Park (ADR-0014): a receive-only (SSE) epoch that ended with an empty desired set must
-            # not redial — the gateway 400s an empty ?channels=. Wait until a subscribe repopulates
-            # it (close() cancels the supervisor, unwinding this wait). WS never parks: its dial
-            # takes no channels, so capabilities.can_subscribe is True and this is skipped.
-            if (
-                not transport.capabilities.can_subscribe
-                and not self._subscriptions.resume_channels()
-            ):
+            # A deliberate SSE change (subscribe/unsubscribe on a live receive-only stream) or an
+            # empty desired set is NOT a failure, so it is handled before the reconnect-policy gate:
+            # a bounce must redial to apply the new channel set even when reconnect=False, and an
+            # empty set must park (not disconnect). WS never enters here — it subscribes live
+            # (can_subscribe True) and _bounce_pending is only set on the SSE path.
+            sse = not transport.capabilities.can_subscribe
+            if self._bounce_pending or (sse and not self._subscriptions.resume_channels()):
                 self._bounce_pending = False
                 self._state = ConnectionState.RECONNECTING
-                self._desired_changed.clear()
-                await self._desired_changed.wait()
-                if not self._running():
-                    self._state = ConnectionState.DISCONNECTED
-                    return
-                continue  # redial immediately with the repopulated set (no backoff)
+                # Park (ADR-0014) while the SSE desired set is empty — dialing an empty ?channels=
+                # is a gateway 400. Re-check on every wake: _desired_changed fires on ANY
+                # subscribe/unsubscribe, not only repopulating ones, so a stray wake must not redial
+                # empty. close() cancels the supervisor, unwinding this wait.
+                while sse and not self._subscriptions.resume_channels():
+                    self._desired_changed.clear()
+                    await self._desired_changed.wait()
+                    if not self._running():
+                        self._state = ConnectionState.DISCONNECTED
+                        return
+                continue  # redial immediately with the current set — no backoff, no attempt burned
 
-            # Deliberate bounce (subscribe/unsubscribe on live SSE): reconnect now — no backoff, and
-            # don't burn a retry attempt (this was not a failure).
-            if self._bounce_pending:
-                self._bounce_pending = False
-                self._state = ConnectionState.RECONNECTING
-                continue
-
+            if not self._reconnect:
+                self._state = ConnectionState.DISCONNECTED
+                return
             self._state = ConnectionState.RECONNECTING
             await self._backoff(attempt)
             attempt += 1

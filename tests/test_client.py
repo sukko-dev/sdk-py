@@ -642,3 +642,47 @@ async def test_sse_first_connect_empty_raises() -> None:
     with pytest.raises(SukkoError):
         await asyncio.wait_for(client.connect(), timeout=1.0)  # no subscribe → empty → raises
     await client.close()
+
+
+async def test_sse_park_survives_stray_wake_and_stays_revivable() -> None:
+    """A stray subscribe/unsubscribe while parked (empty desired set) must NOT redial an empty
+    ?channels= — with the real SSE transport that dies on empty, so a stray wake would strand the
+    client. The park re-checks emptiness on each wake and stays parked until a real subscribe."""
+    dialed: list[list[str]] = []
+
+    def factory(channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        if not channels:
+            raise ValueError("SSE requires at least one channel")  # mirrors SseTransport ctor
+        dialed.append(list(channels))
+        return FakeTransport(FakeServer(), capabilities=SSE_CAPABILITIES)
+
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.subscribe(["a"])
+    await client.connect()
+    await _drain()
+    await client.unsubscribe(["a"])  # empties → park
+    await _drain()
+    await client.unsubscribe(["never-subscribed"])  # stray wake: must not dial empty / die
+    await _drain()
+    await client.subscribe(["c"])  # client must still be alive → dials ["c"]
+    await _drain()
+    assert dialed == [["a"], ["c"]], f"a stray wake redialed empty / stranded the client: {dialed}"
+    await client.close()
+
+
+async def test_sse_bounce_redials_even_with_reconnect_false() -> None:
+    """A deliberate bounce is not a failure, so subscribe on a live SSE stream redials even when
+    reconnect=False — it must not silently disconnect the client."""
+    epochs, factory = _sse_epoch_recorder()
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=False)
+    await client.subscribe(["a"])
+    await client.connect()
+    await _drain()
+    assert epochs == [["a"]]
+
+    await client.subscribe(["b"])  # live SSE bounce — must redial despite reconnect=False
+    await _drain()
+    assert len(epochs) == 2, "bounce must redial even with reconnect=False"
+    assert sorted(epochs[1]) == ["a", "b"]
+    assert client.state is ConnectionState.CONNECTED
+    await client.close()

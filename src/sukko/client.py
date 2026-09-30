@@ -210,6 +210,13 @@ class SukkoClient:
         self._connect_result: asyncio.Future[None] | None = None
         self._last_frame_at = 0.0
         self._recovery_wake = asyncio.Event()
+        # SSE subscribe/unsubscribe bounce (ADR-0014/0015): a receive-only transport can't send a
+        # subscription frame, so a live subscribe/unsubscribe closes the epoch and the supervisor
+        # redials with the new channel set (resuming via Last-Event-ID). _bounce marks that a close
+        # was deliberate (reconnect immediately, no backoff, no retry-attempt burned);
+        # _desired_changed wakes a supervisor parked on an empty SSE desired set.
+        self._bounce_pending = False
+        self._desired_changed = asyncio.Event()
         self._bg_tasks: set[asyncio.Task[None]] = set()  # tracked fire-and-forget refresh tasks
 
     # --- public API ---------------------------------------------------------------------------
@@ -258,28 +265,41 @@ class SukkoClient:
         self._queue.close()
 
     async def subscribe(self, channels: Sequence[str]) -> None:
-        """Subscribe to ``channels``. On a live WS connection the request is sent now; otherwise the
-        channels are recorded and applied on the next (re)connect."""
+        """Subscribe to ``channels``. On a live WS connection the request is sent now; on a live SSE
+        connection the stream is bounced to pick up the new channel set (resuming via
+        Last-Event-ID); otherwise the channels are recorded and applied on the next (re)connect."""
         chans = list(channels)
         self._subscriptions.want(chans)
+        self._desired_changed.set()  # wake a supervisor parked on an empty SSE desired set
         transport = self._transport
-        if (
-            transport is not None
-            and self._state is ConnectionState.CONNECTED
-            and transport.capabilities.can_subscribe
-        ):
+        if transport is None or self._state is not ConnectionState.CONNECTED:
+            return  # not live: recorded; applied on the next connect (never auto-connects)
+        if transport.capabilities.can_subscribe:
             await self._send(transport, Subscribe(data=SubscribeData(channels=chans)))
+        else:
+            await self._bounce()  # live SSE: redial with the new set
 
     async def unsubscribe(self, channels: Sequence[str]) -> None:
         chans = list(channels)
         transport = self._transport
-        if (
-            transport is not None
-            and self._state is ConnectionState.CONNECTED
-            and transport.capabilities.can_subscribe
-        ):
+        live = transport is not None and self._state is ConnectionState.CONNECTED
+        if live and transport.capabilities.can_subscribe:
             await self._send(transport, Unsubscribe(data=UnsubscribeData(channels=chans)))
+            self._subscriptions.unwant(chans)
+            return
         self._subscriptions.unwant(chans)
+        self._desired_changed.set()
+        if live:  # live SSE: redial with the reduced set (or park if it is now empty)
+            await self._bounce()
+
+    async def _bounce(self) -> None:
+        """Close the live SSE epoch so the supervisor redials with the current desired set. The
+        close is marked deliberate so the reconnect is immediate (no backoff, no retry attempt)."""
+        self._bounce_pending = True
+        transport = self._transport
+        if transport is not None:
+            with suppress(SukkoError):
+                await transport.close()
 
     async def publish(self, channel: str, data: object) -> None:
         """Publish over the WS connection (fire-and-forget; ack/error surface via events). Raises
@@ -427,6 +447,31 @@ class SukkoClient:
             if not self._running() or not self._reconnect or terminal:
                 self._state = ConnectionState.DISCONNECTED
                 return
+
+            # Park (ADR-0014): a receive-only (SSE) epoch that ended with an empty desired set must
+            # not redial — the gateway 400s an empty ?channels=. Wait until a subscribe repopulates
+            # it (close() cancels the supervisor, unwinding this wait). WS never parks: its dial
+            # takes no channels, so capabilities.can_subscribe is True and this is skipped.
+            if (
+                not transport.capabilities.can_subscribe
+                and not self._subscriptions.resume_channels()
+            ):
+                self._bounce_pending = False
+                self._state = ConnectionState.RECONNECTING
+                self._desired_changed.clear()
+                await self._desired_changed.wait()
+                if not self._running():
+                    self._state = ConnectionState.DISCONNECTED
+                    return
+                continue  # redial immediately with the repopulated set (no backoff)
+
+            # Deliberate bounce (subscribe/unsubscribe on live SSE): reconnect now — no backoff, and
+            # don't burn a retry attempt (this was not a failure).
+            if self._bounce_pending:
+                self._bounce_pending = False
+                self._state = ConnectionState.RECONNECTING
+                continue
+
             self._state = ConnectionState.RECONNECTING
             await self._backoff(attempt)
             attempt += 1

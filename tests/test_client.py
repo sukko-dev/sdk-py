@@ -487,14 +487,17 @@ async def test_sse_last_event_id_threaded_across_reconnect() -> None:
     Client-managed SSE reconnect was previously losing the cursor). Pins first-connect-carries-None
     and that the cursor advances to what the prior epoch reached."""
     calls: list[str | None] = []
-    epoch_ids = ["evt-1", "evt-2"]
+    # Epoch 1 reaches a cursor; epoch 2 reaches NONE (a cursorless epoch — e.g. it dropped before
+    # any id: arrived). The not-None guard must keep epoch 1's cursor so epoch 3 still resumes from
+    # it. Removing the guard makes epoch 3 receive None → the calls[2] assertion goes red.
+    epoch_ids: list[str | None] = ["evt-1", None]
     created: list[FakeTransport] = []
 
     def factory(_channels: Sequence[str], last_event_id: str | None = None) -> FakeTransport:
         calls.append(last_event_id)
         server = FakeServer()
         transport = FakeTransport(server, capabilities=SSE_CAPABILITIES)
-        # Simulate this epoch's transport having captured an id: cursor by the time it drops.
+        # Simulate the id: cursor this epoch's transport captured by the time it drops.
         idx = len(created)
         transport.last_event_id = epoch_ids[idx] if idx < len(epoch_ids) else None
         created.append(transport)
@@ -506,14 +509,21 @@ async def test_sse_last_event_id_threaded_across_reconnect() -> None:
     await _drain()
     assert calls[0] is None  # first connect carries no resume cursor
 
-    # Drop epoch 1 with a non-terminal close → the supervisor backs off, then reconnects.
+    # Drop epoch 1 (has cursor "evt-1") → reconnect epoch 2.
     created[0].server.close_connection(CLOSE_CODES.GOING_AWAY, CloseDirection.REMOTE)
     await _drain()
     await clock.advance(2.0)  # elapse the reconnect backoff (full-jitter, base 1s)
     await _drain()
-
     assert len(created) >= 2, "expected a reconnect epoch after the non-terminal close"
     assert calls[1] == "evt-1", "reconnect must echo the id the dropped epoch reached"
+
+    # Drop epoch 2 (cursorless) → reconnect epoch 3 must STILL carry "evt-1" (guard preserved it).
+    created[1].server.close_connection(CLOSE_CODES.GOING_AWAY, CloseDirection.REMOTE)
+    await _drain()
+    await clock.advance(2.0)
+    await _drain()
+    assert len(created) >= 3, "expected a second reconnect epoch"
+    assert calls[2] == "evt-1", "a cursorless epoch must not clobber the held resume cursor"
     await client.close()
 
 
@@ -533,4 +543,20 @@ async def test_ws_factory_ignores_resume_cursor_arg() -> None:
     await client.connect()
     await _drain()
     assert client.state is ConnectionState.CONNECTED
+    await client.close()
+
+
+async def test_connect_raises_when_supervisor_dies_before_connecting() -> None:
+    """A transport_factory that raises (e.g. a stale 1-arg factory not migrated to the 2-arg
+    signature, or any bad factory) must surface as a connect() failure — not hang forever with the
+    error stranded on the dead supervisor task."""
+
+    def bad_factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        raise RuntimeError("boom: factory cannot build a transport")
+
+    client = SukkoClient(
+        "ws://test", transport_factory=bad_factory, clock=FakeClock(), reconnect=True
+    )
+    with pytest.raises(SukkoError):  # non-SukkoError is wrapped as ConfigurationError
+        await asyncio.wait_for(client.connect(), timeout=1.0)
     await client.close()

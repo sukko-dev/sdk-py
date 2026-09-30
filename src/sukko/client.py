@@ -230,6 +230,10 @@ class SukkoClient:
         self._should_run = True
         self._connect_result = asyncio.get_running_loop().create_future()
         self._supervisor = asyncio.ensure_future(self._run())
+        # If _run dies before it resolves the connect future — e.g. a bad transport_factory raising
+        # a non-SukkoError — fail connect() rather than leave it awaiting forever with the error
+        # stranded, unobserved, on the dead task.
+        self._supervisor.add_done_callback(self._on_supervisor_done)
         await self._connect_result
 
     async def close(self) -> None:
@@ -449,6 +453,23 @@ class SukkoClient:
     def _fail_connect(self, exc: SukkoError) -> None:
         if self._connect_result is not None and not self._connect_result.done():
             self._connect_result.set_exception(exc)
+
+    def _on_supervisor_done(self, task: asyncio.Task[None]) -> None:
+        """Backstop for a supervisor that ends before ``connect()`` is resolved. Normal operation
+        resolves/fails the connect future inside ``_run``, making this a no-op; but a crash in
+        ``_run`` (a ``transport_factory`` raising a non-``SukkoError``, say) would otherwise leave
+        ``connect()`` awaiting forever, so surface it as a connect failure instead."""
+        if self._connect_result is None or self._connect_result.done():
+            return
+        if task.cancelled():
+            self._connect_result.cancel()
+            return
+        exc = task.exception()
+        if exc is None:
+            exc = ConfigurationError("transport supervisor stopped before the first connection")
+        elif not isinstance(exc, SukkoError):
+            exc = ConfigurationError(f"transport supervisor failed before connect: {exc}")
+        self._connect_result.set_exception(exc)
 
     # --- connection lifecycle -----------------------------------------------------------------
 

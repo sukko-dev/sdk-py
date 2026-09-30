@@ -97,9 +97,14 @@ logger = logging.getLogger("sukko.client")
 
 _P = ParamSpec("_P")
 
-#: Builds a fresh transport for a connection epoch, given the channels to resume (used by SSE's
-#: connect-time ``channels``; the WebSocket factory ignores them and subscribes dynamically).
-TransportFactory = Callable[[Sequence[str]], Transport]
+#: Builds a fresh transport for a connection epoch, given (1) the channels to resume (used by
+#: SSE's connect-time ``channels``; the WebSocket factory ignores them and subscribes
+#: dynamically) and (2) the opaque resume cursor from the previous epoch — the last SSE event
+#: ``id`` the dropped transport saw, or ``None`` on the first connect. An SSE factory passes it
+#: as ``SseTransport(last_event_id=...)`` so the reconnect echoes ``Last-Event-ID`` and the
+#: server replays the gap; the WebSocket factory ignores it (WS resumes via its own ``last_pos``
+#: cursor). The cursor is opaque — pass it through verbatim, never parse it.
+TransportFactory = Callable[[Sequence[str], str | None], Transport]
 
 ErrorListener = Callable[[SukkoError], None]
 NotGrantedListener = Callable[[frozenset[str]], None]
@@ -205,6 +210,13 @@ class SukkoClient:
         self._connect_result: asyncio.Future[None] | None = None
         self._last_frame_at = 0.0
         self._recovery_wake = asyncio.Event()
+        # SSE subscribe/unsubscribe bounce (ADR-0014/0015): a receive-only transport can't send a
+        # subscription frame, so a live subscribe/unsubscribe closes the epoch and the supervisor
+        # redials with the new channel set (resuming via Last-Event-ID). _bounce marks that a close
+        # was deliberate (reconnect immediately, no backoff, no retry-attempt burned);
+        # _desired_changed wakes a supervisor parked on an empty SSE desired set.
+        self._bounce_pending = False
+        self._desired_changed = asyncio.Event()
         self._bg_tasks: set[asyncio.Task[None]] = set()  # tracked fire-and-forget refresh tasks
 
     # --- public API ---------------------------------------------------------------------------
@@ -225,6 +237,10 @@ class SukkoClient:
         self._should_run = True
         self._connect_result = asyncio.get_running_loop().create_future()
         self._supervisor = asyncio.ensure_future(self._run())
+        # If _run dies before it resolves the connect future — e.g. a bad transport_factory raising
+        # a non-SukkoError — fail connect() rather than leave it awaiting forever with the error
+        # stranded, unobserved, on the dead task.
+        self._supervisor.add_done_callback(self._on_supervisor_done)
         await self._connect_result
 
     async def close(self) -> None:
@@ -249,28 +265,46 @@ class SukkoClient:
         self._queue.close()
 
     async def subscribe(self, channels: Sequence[str]) -> None:
-        """Subscribe to ``channels``. On a live WS connection the request is sent now; otherwise the
-        channels are recorded and applied on the next (re)connect."""
+        """Subscribe to ``channels``. On a live WS connection the request is sent now; on a live SSE
+        connection the stream is bounced to pick up the new channel set (resuming via
+        Last-Event-ID); otherwise the channels are recorded and applied on the next (re)connect."""
         chans = list(channels)
         self._subscriptions.want(chans)
+        self._desired_changed.set()  # wake a supervisor parked on an empty SSE desired set
         transport = self._transport
-        if (
-            transport is not None
-            and self._state is ConnectionState.CONNECTED
-            and transport.capabilities.can_subscribe
-        ):
+        if transport is None or self._state is not ConnectionState.CONNECTED:
+            return  # not live: recorded; applied on the next connect (never auto-connects)
+        if transport.capabilities.can_subscribe:
             await self._send(transport, Subscribe(data=SubscribeData(channels=chans)))
+        else:
+            await self._bounce()  # live SSE: redial with the new set
 
     async def unsubscribe(self, channels: Sequence[str]) -> None:
         chans = list(channels)
         transport = self._transport
-        if (
-            transport is not None
-            and self._state is ConnectionState.CONNECTED
-            and transport.capabilities.can_subscribe
-        ):
-            await self._send(transport, Unsubscribe(data=UnsubscribeData(channels=chans)))
+        if transport is not None and self._state is ConnectionState.CONNECTED:
+            if transport.capabilities.can_subscribe:
+                await self._send(transport, Unsubscribe(data=UnsubscribeData(channels=chans)))
+                self._subscriptions.unwant(chans)
+                return
+            # live SSE: drop the channels, then bounce (redial with the reduced set, or park if it
+            # is now empty).
+            self._subscriptions.unwant(chans)
+            self._desired_changed.set()
+            await self._bounce()
+            return
+        # not live: recorded; applied on the next connect.
         self._subscriptions.unwant(chans)
+        self._desired_changed.set()
+
+    async def _bounce(self) -> None:
+        """Close the live SSE epoch so the supervisor redials with the current desired set. The
+        close is marked deliberate so the reconnect is immediate (no backoff, no retry attempt)."""
+        self._bounce_pending = True
+        transport = self._transport
+        if transport is not None:
+            with suppress(SukkoError):
+                await transport.close()
 
     async def publish(self, channel: str, data: object) -> None:
         """Publish over the WS connection (fire-and-forget; ack/error surface via events). Raises
@@ -350,8 +384,16 @@ class SukkoClient:
 
     async def _run(self) -> None:
         attempt = 0
+        # Opaque SSE resume cursor threaded across connection epochs: the last event id the
+        # previous epoch's transport saw, echoed as Last-Event-ID on the next connect so the
+        # server replays the gap (WHATWG EventSource model; WS ignores it and resumes via
+        # last_pos). Loop-local by design — an explicit close()+reconnect starts fresh; a caller
+        # wanting cross-restart persistence seeds it through their own factory.
+        resume_cursor: str | None = None
         while self._running():
-            transport = self._transport_factory(self._subscriptions.resume_channels())
+            transport = self._transport_factory(
+                self._subscriptions.resume_channels(), resume_cursor
+            )
             try:
                 await transport.open()
             except SukkoError as exc:
@@ -397,11 +439,42 @@ class SukkoClient:
                 terminal = any(getattr(e, "terminal", False) for e in eg.exceptions)
             finally:
                 self._transport = None
+                # Harvest the cursor this epoch reached so the next connect resumes from it.
+                # SSE-only (getattr: the Protocol doesn't declare it, WS has none); guard on
+                # not-None so a transport without a cursor never clobbers a good one.
+                harvested = getattr(transport, "last_event_id", None)
+                if harvested is not None:
+                    resume_cursor = harvested
                 await self._on_disconnected(transport)
                 with suppress(SukkoError):
                     await transport.close()
 
-            if not self._running() or not self._reconnect or terminal:
+            if not self._running() or terminal:
+                self._state = ConnectionState.DISCONNECTED
+                return
+
+            # A deliberate SSE change (subscribe/unsubscribe on a live receive-only stream) or an
+            # empty desired set is NOT a failure, so it is handled before the reconnect-policy gate:
+            # a bounce must redial to apply the new channel set even when reconnect=False, and an
+            # empty set must park (not disconnect). WS never enters here — it subscribes live
+            # (can_subscribe True) and _bounce_pending is only set on the SSE path.
+            sse = not transport.capabilities.can_subscribe
+            if self._bounce_pending or (sse and not self._subscriptions.resume_channels()):
+                self._bounce_pending = False
+                self._state = ConnectionState.RECONNECTING
+                # Park (ADR-0014) while the SSE desired set is empty — dialing an empty ?channels=
+                # is a gateway 400. Re-check on every wake: _desired_changed fires on ANY
+                # subscribe/unsubscribe, not only repopulating ones, so a stray wake must not redial
+                # empty. close() cancels the supervisor, unwinding this wait.
+                while sse and not self._subscriptions.resume_channels():
+                    self._desired_changed.clear()
+                    await self._desired_changed.wait()
+                    if not self._running():
+                        self._state = ConnectionState.DISCONNECTED
+                        return
+                continue  # redial immediately with the current set — no backoff, no attempt burned
+
+            if not self._reconnect:
                 self._state = ConnectionState.DISCONNECTED
                 return
             self._state = ConnectionState.RECONNECTING
@@ -430,6 +503,23 @@ class SukkoClient:
     def _fail_connect(self, exc: SukkoError) -> None:
         if self._connect_result is not None and not self._connect_result.done():
             self._connect_result.set_exception(exc)
+
+    def _on_supervisor_done(self, task: asyncio.Task[None]) -> None:
+        """Backstop for a supervisor that ends before ``connect()`` is resolved. Normal operation
+        resolves/fails the connect future inside ``_run``, making this a no-op; but a crash in
+        ``_run`` (a ``transport_factory`` raising a non-``SukkoError``, say) would otherwise leave
+        ``connect()`` awaiting forever, so surface it as a connect failure instead."""
+        if self._connect_result is None or self._connect_result.done():
+            return
+        if task.cancelled():
+            self._connect_result.cancel()
+            return
+        exc = task.exception()
+        if exc is None:
+            exc = ConfigurationError("transport supervisor stopped before the first connection")
+        elif not isinstance(exc, SukkoError):
+            exc = ConfigurationError(f"transport supervisor failed before connect: {exc}")
+        self._connect_result.set_exception(exc)
 
     # --- connection lifecycle -----------------------------------------------------------------
 
@@ -656,7 +746,12 @@ class SukkoClient:
             # supervisor (§VI). Log and continue.
             logger.exception("on_error callback raised")
 
-    def _default_transport_factory(self, channels: Sequence[str]) -> Transport:
+    def _default_transport_factory(
+        self, channels: Sequence[str], last_event_id: str | None = None
+    ) -> Transport:
+        # WebSocket is the default transport; it ignores both the SSE connect-time channels and
+        # the SSE Last-Event-ID cursor (it resumes via its own last_pos, §recovery).
+        del channels, last_event_id
         return WebSocketTransport(
             self._url,
             token=self._auth.token,

@@ -35,7 +35,7 @@ def test_full_jitter_backoff_rejects_negative_attempt() -> None:
 def test_should_retry_zero_is_unlimited_and_n_is_exactly_n() -> None:
     # reconnect_attempts=0 = UNLIMITED (not disabled), and N = exactly N reconnects
     # (attempts 0..N-1). The old `(attempt+1) < N` disabled 0 and gave only N-1 (off-by-one vs js).
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(FakeServer())
 
     unlimited = SukkoClient(
@@ -64,7 +64,7 @@ async def test_no_heartbeat_on_receive_only_sse() -> None:
     clock = FakeClock()
     server = FakeServer()
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server, capabilities=SSE_CAPABILITIES)
 
     client = SukkoClient(
@@ -90,7 +90,7 @@ async def test_heartbeat_stays_alive_when_pong_received() -> None:
     server = FakeServer()
     server.enable_auto_ack()  # auto-acks the heartbeat with a Pong
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     client = SukkoClient(

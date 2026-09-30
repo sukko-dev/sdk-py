@@ -25,7 +25,7 @@ from sukko.messages import (
     Subscribe,
     SubscriptionAck,
 )
-from sukko.transport.base import ConnectionState
+from sukko.transport.base import SSE_CAPABILITIES, ConnectionState
 
 
 async def _drain(times: int = 6) -> None:
@@ -37,7 +37,7 @@ async def _drain(times: int = 6) -> None:
 def _make_client(
     server: FakeServer, *, clock: FakeClock | None = None, **kwargs: object
 ) -> SukkoClient:
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         return FakeTransport(server)
 
     return SukkoClient(
@@ -166,7 +166,7 @@ def _multi_epoch_client(
     """A client whose factory hands out ``servers`` one per epoch (for reconnect tests)."""
     index = [0]
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         server = servers[index[0]]
         index[0] += 1
         return FakeTransport(server)
@@ -312,7 +312,7 @@ async def test_close_does_not_raise_when_queue_is_full() -> None:
 async def test_terminal_4001_close_stops_reconnect() -> None:
     created: list[FakeTransport] = []
 
-    def factory(_channels: Sequence[str]) -> FakeTransport:
+    def factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
         server = FakeServer()
         server.enable_auto_ack()
         transport = FakeTransport(server)
@@ -478,4 +478,211 @@ async def test_recovery_deadline_suspended_while_consumer_backpressured() -> Non
     await clock.advance(11.0)
     await _drain()
     assert any(isinstance(e, RecoveryInterruptedError) for e in errors)  # fires after resume
+    await client.close()
+
+
+async def test_sse_last_event_id_threaded_across_reconnect() -> None:
+    """The supervisor threads a dropped SSE transport's last_event_id into the NEXT epoch's
+    factory call, so the reconnect echoes Last-Event-ID and the server replays the gap (the fix:
+    Client-managed SSE reconnect was previously losing the cursor). Pins first-connect-carries-None
+    and that the cursor advances to what the prior epoch reached."""
+    calls: list[str | None] = []
+    # Epoch 1 reaches a cursor; epoch 2 reaches NONE (a cursorless epoch — e.g. it dropped before
+    # any id: arrived). The not-None guard must keep epoch 1's cursor so epoch 3 still resumes from
+    # it. Removing the guard makes epoch 3 receive None → the calls[2] assertion goes red.
+    epoch_ids: list[str | None] = ["evt-1", None]
+    created: list[FakeTransport] = []
+
+    def factory(_channels: Sequence[str], last_event_id: str | None = None) -> FakeTransport:
+        calls.append(last_event_id)
+        server = FakeServer()
+        transport = FakeTransport(server, capabilities=SSE_CAPABILITIES)
+        # Simulate the id: cursor this epoch's transport captured by the time it drops.
+        idx = len(created)
+        transport.last_event_id = epoch_ids[idx] if idx < len(epoch_ids) else None
+        created.append(transport)
+        return transport
+
+    clock = FakeClock()
+    client = SukkoClient("ws://test", transport_factory=factory, clock=clock, reconnect=True)
+    await client.subscribe(["t.a"])  # SSE needs a channel; recorded before connect (no bounce)
+    await client.connect()
+    await _drain()
+    assert calls[0] is None  # first connect carries no resume cursor
+
+    # Drop epoch 1 (has cursor "evt-1") → reconnect epoch 2 (desired set non-empty, no park).
+    created[0].server.close_connection(CLOSE_CODES.GOING_AWAY, CloseDirection.REMOTE)
+    await _drain()
+    await clock.advance(2.0)  # elapse the reconnect backoff (full-jitter, base 1s)
+    await _drain()
+    assert len(created) >= 2, "expected a reconnect epoch after the non-terminal close"
+    assert calls[1] == "evt-1", "reconnect must echo the id the dropped epoch reached"
+
+    # Drop epoch 2 (cursorless) → reconnect epoch 3 must STILL carry "evt-1" (guard preserved it).
+    created[1].server.close_connection(CLOSE_CODES.GOING_AWAY, CloseDirection.REMOTE)
+    await _drain()
+    await clock.advance(2.0)
+    await _drain()
+    assert len(created) >= 3, "expected a second reconnect epoch"
+    assert calls[2] == "evt-1", "a cursorless epoch must not clobber the held resume cursor"
+    await client.close()
+
+
+async def test_ws_factory_ignores_resume_cursor_arg() -> None:
+    """A transport without a last_event_id (the WebSocket case) never clobbers the resume cursor:
+    the default WS factory accepts and ignores the arg, and the getattr harvest yields None so the
+    supervisor keeps whatever cursor it held."""
+    # The default factory is WebSocket; connecting proves it accepts the 2-arg call shape.
+    server = FakeServer()
+    server.enable_auto_ack()
+
+    def factory(_channels: Sequence[str], last_event_id: str | None = None) -> FakeTransport:
+        assert last_event_id is None  # first (and only) connect
+        return FakeTransport(server)  # WEBSOCKET_CAPABILITIES, no last_event_id attr
+
+    client = SukkoClient("ws://test", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.connect()
+    await _drain()
+    assert client.state is ConnectionState.CONNECTED
+    await client.close()
+
+
+async def test_connect_raises_when_supervisor_dies_before_connecting() -> None:
+    """A transport_factory that raises (e.g. a stale 1-arg factory not migrated to the 2-arg
+    signature, or any bad factory) must surface as a connect() failure — not hang forever with the
+    error stranded on the dead supervisor task."""
+
+    def bad_factory(_channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        raise RuntimeError("boom: factory cannot build a transport")
+
+    client = SukkoClient(
+        "ws://test", transport_factory=bad_factory, clock=FakeClock(), reconnect=True
+    )
+    with pytest.raises(SukkoError):  # non-SukkoError is wrapped as ConfigurationError
+        await asyncio.wait_for(client.connect(), timeout=1.0)
+    await client.close()
+
+
+def _sse_epoch_recorder() -> tuple[list[list[str]], object]:
+    """A factory that records the channel set each SSE epoch is built with and returns an
+    SSE-capability FakeTransport per epoch."""
+    epochs: list[list[str]] = []
+
+    def factory(channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        epochs.append(list(channels))
+        return FakeTransport(FakeServer(), capabilities=SSE_CAPABILITIES)
+
+    return epochs, factory
+
+
+async def test_sse_subscribe_on_live_bounces_with_union() -> None:
+    """subscribe() on a live SSE stream redials with the union of channels — immediately, no
+    backoff (a deliberate bounce, not a failure)."""
+    epochs, factory = _sse_epoch_recorder()
+    clock = FakeClock()
+    client = SukkoClient("ws://t", transport_factory=factory, clock=clock, reconnect=True)
+    await client.subscribe(["a"])  # recorded pre-connect (no bounce)
+    await client.connect()
+    await _drain()
+    assert epochs[0] == ["a"]
+
+    await client.subscribe(["b"])  # live SSE → bounce
+    await _drain()  # NOTE: no clock.advance — a bounce must not wait on backoff
+    assert len(epochs) >= 2, "subscribe on live SSE must redial immediately (no backoff)"
+    assert sorted(epochs[1]) == ["a", "b"], f"redial must carry the union, got {epochs[1]}"
+    await client.close()
+
+
+async def test_sse_unsubscribe_on_live_bounces_with_reduced_set() -> None:
+    epochs, factory = _sse_epoch_recorder()
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.subscribe(["a", "b"])
+    await client.connect()
+    await _drain()
+    assert sorted(epochs[0]) == ["a", "b"]
+
+    await client.unsubscribe(["b"])  # live SSE → bounce with the reduced set
+    await _drain()
+    assert len(epochs) >= 2
+    assert epochs[1] == ["a"], f"redial must carry the reduced set, got {epochs[1]}"
+    await client.close()
+
+
+async def test_sse_unsubscribe_to_empty_parks_then_subscribe_wakes() -> None:
+    """Unsubscribing the last channel parks the supervisor (no dial into an empty ?channels=);
+    a later subscribe wakes it and dials the new set — ADR-0014's race case."""
+    epochs, factory = _sse_epoch_recorder()
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.subscribe(["a"])
+    await client.connect()
+    await _drain()
+    assert epochs == [["a"]]
+
+    await client.unsubscribe(["a"])  # empties the desired set → park (no redial)
+    await _drain()
+    assert len(epochs) == 1, "must not redial into an empty channel set (parked)"
+
+    await client.subscribe(["c"])  # wakes the parked supervisor
+    await _drain()
+    assert len(epochs) == 2, "a subscribe must wake the parked supervisor and dial"
+    assert epochs[1] == ["c"]
+    await client.close()
+
+
+async def test_sse_first_connect_empty_raises() -> None:
+    """First connect() on SSE with no channels is a caller error (ADR-0014): the SSE transport
+    rejects an empty set and connect() surfaces it rather than hanging."""
+
+    def factory(channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        if not channels:
+            raise ValueError("SSE requires at least one channel")  # mirrors SseTransport ctor
+        return FakeTransport(FakeServer(), capabilities=SSE_CAPABILITIES)
+
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    with pytest.raises(SukkoError):
+        await asyncio.wait_for(client.connect(), timeout=1.0)  # no subscribe → empty → raises
+    await client.close()
+
+
+async def test_sse_park_survives_stray_wake_and_stays_revivable() -> None:
+    """A stray subscribe/unsubscribe while parked (empty desired set) must NOT redial an empty
+    ?channels= — with the real SSE transport that dies on empty, so a stray wake would strand the
+    client. The park re-checks emptiness on each wake and stays parked until a real subscribe."""
+    dialed: list[list[str]] = []
+
+    def factory(channels: Sequence[str], _last_event_id: str | None = None) -> FakeTransport:
+        if not channels:
+            raise ValueError("SSE requires at least one channel")  # mirrors SseTransport ctor
+        dialed.append(list(channels))
+        return FakeTransport(FakeServer(), capabilities=SSE_CAPABILITIES)
+
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=True)
+    await client.subscribe(["a"])
+    await client.connect()
+    await _drain()
+    await client.unsubscribe(["a"])  # empties → park
+    await _drain()
+    await client.unsubscribe(["never-subscribed"])  # stray wake: must not dial empty / die
+    await _drain()
+    await client.subscribe(["c"])  # client must still be alive → dials ["c"]
+    await _drain()
+    assert dialed == [["a"], ["c"]], f"a stray wake redialed empty / stranded the client: {dialed}"
+    await client.close()
+
+
+async def test_sse_bounce_redials_even_with_reconnect_false() -> None:
+    """A deliberate bounce is not a failure, so subscribe on a live SSE stream redials even when
+    reconnect=False — it must not silently disconnect the client."""
+    epochs, factory = _sse_epoch_recorder()
+    client = SukkoClient("ws://t", transport_factory=factory, clock=FakeClock(), reconnect=False)
+    await client.subscribe(["a"])
+    await client.connect()
+    await _drain()
+    assert epochs == [["a"]]
+
+    await client.subscribe(["b"])  # live SSE bounce — must redial despite reconnect=False
+    await _drain()
+    assert len(epochs) == 2, "bounce must redial even with reconnect=False"
+    assert sorted(epochs[1]) == ["a", "b"]
+    assert client.state is ConnectionState.CONNECTED
     await client.close()

@@ -381,3 +381,43 @@ def decode_server_message(data: bytes | str) -> ServerMessage:
 def encode_client(message: ClientMessage) -> bytes:
     """Encode a client→server message to JSON bytes for transport."""
     return _encoder.encode(message)
+
+
+# =============================================================================================
+# SSE reconnect-recovery control frames (gateway.openapi 1.0.3) — SSE-only, NOT WS ServerMessage
+# =============================================================================================
+# The server emits these only on the gRPC Subscribe / SSE path, so they live in gateway.openapi, not
+# the WS client-ws.asyncapi.yaml this SDK vendors — and are deliberately NOT ``ServerMessage``
+# members (the contract-coverage count stays intact). The read-pump decodes them in a second pass
+# when the ``ServerMessage`` union rejects the tag, and translates them onto existing surfaces
+# (ADR-0006): ``no_replay`` → one :class:`PossibleGap` per channel; ``replay_truncated`` →
+# :class:`~sukko.errors.RecoveryInterruptedError` via ``on_error``.
+
+
+class NoReplay(msgspec.Struct, tag="no_replay"):
+    """SSE reconnect: the server could not replay these cursor channels (unauthorized, no Kafka
+    mapping on a direct backend, or the replay errored). Treat each as a possible gap."""
+
+    channels: list[str]
+
+
+class ReplayTruncated(msgspec.Struct, tag="replay_truncated"):
+    """SSE reconnect: the replay was cut short at the server's ``WS_MAX_REPLAY_MESSAGES`` cap — a
+    prefix of ``replayed`` records was delivered and a gap remains."""
+
+    replayed: int
+
+
+#: SSE-only recovery control frames; second-pass decode via :func:`decode_sse_control_frame`.
+SSEControlFrame: TypeAlias = NoReplay | ReplayTruncated
+
+_sse_control_decoder: msgspec.json.Decoder[SSEControlFrame] = msgspec.json.Decoder(SSEControlFrame)
+
+
+def decode_sse_control_frame(data: bytes | str) -> SSEControlFrame:
+    """Decode an SSE-only recovery control frame (``no_replay`` / ``replay_truncated``).
+
+    Raises :class:`msgspec.ValidationError` on any other tag or malformed input — the read-pump's
+    second-pass fallthrough to log-and-skip.
+    """
+    return _sse_control_decoder.decode(data.encode() if isinstance(data, str) else data)

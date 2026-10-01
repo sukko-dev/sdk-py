@@ -396,6 +396,66 @@ async def test_recovery_interrupted_surfaced_via_on_error() -> None:
     await client.close()
 
 
+async def test_no_replay_control_frame_emits_possible_gap_per_channel() -> None:
+    """SSE ``no_replay`` control frame → one PossibleGap per channel on messages() (ADR-0006).
+
+    sukko-py's SSE recovery is optimistic (no blanket PossibleGap on reopen), so ``no_replay`` is
+    the only signal that a cursor channel went unrecovered — it must surface, not be dropped.
+    """
+    server = FakeServer()
+    server.enable_auto_ack()
+    client = _make_client(server)
+    await client.connect()
+    await client.subscribe(["acme.a", "acme.b"])
+    await _drain()
+
+    # Raw bytes: no_replay is an SSE-only frame, not a ServerMessage the FakeServer can encode.
+    server.push(b'{"type":"no_replay","channels":["acme.a","acme.b"]}')
+    stream = client.messages()
+    first = await anext(stream)
+    second = await anext(stream)
+    assert isinstance(first, PossibleGap) and first.channel == "acme.a"
+    assert isinstance(second, PossibleGap) and second.channel == "acme.b"
+    await client.close()
+
+
+async def test_replay_truncated_control_frame_surfaced_via_on_error() -> None:
+    """SSE replay_truncated → a channel-less RecoveryInterruptedError via on_error (ADR-0006)."""
+    errors: list[SukkoError] = []
+    server = FakeServer()
+    server.enable_auto_ack()
+    client = _make_client(server, on_error=errors.append)
+    await client.connect()
+    await client.subscribe(["acme.a"])
+    await _drain()
+
+    server.push(b'{"type":"replay_truncated","replayed":3}')
+    await _drain()
+    interrupted = [e for e in errors if isinstance(e, RecoveryInterruptedError)]
+    assert len(interrupted) == 1
+    assert interrupted[0].channel is None  # connection-level, not channel-scoped
+    assert interrupted[0].reason == "replay_truncated"  # programmatic discriminator
+    assert "3" in str(interrupted[0])
+    await client.close()
+
+
+async def test_unknown_control_frame_is_still_dropped() -> None:
+    """A genuinely unknown tag still falls through the second-pass decode to log-and-skip, and the
+    read-pump survives it (a following good frame is delivered)."""
+    server = FakeServer()
+    server.enable_auto_ack()
+    client = _make_client(server)
+    await client.connect()
+    await client.subscribe(["acme.a"])
+    await _drain()
+
+    server.push(b'{"type":"some_future_frame","x":1}')  # neither ServerMessage nor SSE control
+    server.push(Message(seq=1, ts=1, channel="acme.a", data={"ok": True}))
+    item = await anext(client.messages())
+    assert isinstance(item, Message) and item.channel == "acme.a"
+    await client.close()
+
+
 async def test_rest_publish_and_push_through_client_without_connect() -> None:
     """rest_publish/push work through SukkoClient WITHOUT connect(); close() with no
     connect still works (the Phase-4 wiring, previously only component-tested)."""

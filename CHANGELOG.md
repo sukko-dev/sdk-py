@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-04
+
 ### Added
 - Stable message identity `mid` on delivered envelopes: `Message.mid`,
   `ReplayMessage.mid`, and `PublishAck.mid` (optional; `None` on servers that

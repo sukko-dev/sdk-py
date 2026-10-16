@@ -55,6 +55,7 @@ from .messages import (
     HistoryData,
     HistoryError,
     Message,
+    NoReplay,
     PossibleGap,
     Publish,
     PublishAck,
@@ -68,6 +69,7 @@ from .messages import (
     ReplayData,
     ReplayMessage,
     ServerMessage,
+    SSEControlFrame,
     Subscribe,
     SubscribeData,
     SubscribeError,
@@ -77,6 +79,7 @@ from .messages import (
     UnsubscribeError,
     UnsubscriptionAck,
     decode_server_message,
+    decode_sse_control_frame,
     encode_client,
 )
 from .push import PushClient
@@ -561,11 +564,41 @@ class SukkoClient:
             try:
                 message = decode_server_message(data)
             except msgspec.DecodeError:
-                # Covers both malformed JSON and schema/unknown-tag ValidationError (a subclass).
-                # A single bad frame must not kill the read-pump / supervisor — log and skip.
-                logger.warning("dropping undecodable/unknown server frame")
+                # The ServerMessage (WS) union rejected the tag. Before dropping, try the SSE-only
+                # reconnect-recovery control frames (gateway.openapi 1.0.3, ADR-0006): they arrive
+                # over SSE but are not WS ServerMessage members, so they decode in a second pass. A
+                # genuinely malformed/unknown frame still falls through to log-and-skip — a single
+                # bad frame must not kill the read-pump / supervisor.
+                try:
+                    control = decode_sse_control_frame(data)
+                except msgspec.DecodeError:
+                    logger.warning("dropping undecodable/unknown server frame")
+                    continue
+                await self._dispatch_sse_control(control)
                 continue
             await self._dispatch(transport, message)
+
+    async def _dispatch_sse_control(self, control: SSEControlFrame) -> None:
+        """Translate an SSE reconnect-recovery control frame onto existing surfaces (ADR-0006).
+
+        sukko-py's SSE recovery is optimistic: it trusts the server's Last-Event-ID replay and does
+        NOT blanket-emit a ``PossibleGap`` on reopen. So ``no_replay`` is the only signal that a
+        cursor channel went unrecovered — surface one :class:`PossibleGap` per channel (closing a
+        pre-slice-3b silent-loss window). ``replay_truncated`` is a connection-level truncation →
+        a channel-less :class:`~sukko.errors.RecoveryInterruptedError` via ``on_error``.
+        """
+        if isinstance(control, NoReplay):
+            for channel in control.channels:
+                await self._put_delivery(PossibleGap(channel=channel))
+        else:  # ReplayTruncated
+            self._emit_error(
+                RecoveryInterruptedError(
+                    f"SSE reconnect replay truncated at the server cap; "
+                    f"{control.replayed} delivered, a gap remains",
+                    channel=None,
+                    reason="replay_truncated",  # programmatic discriminator (not message match)
+                )
+            )
 
     async def _dispatch(self, transport: Transport, message: ServerMessage) -> None:
         if isinstance(message, (Message, ReplayMessage)):

@@ -1,8 +1,8 @@
 # sukko
 
-Asyncio-first Python client SDK for the [Sukko](https://github.com/sukko-dev/sukko) real-time
-platform — real-time market-data / event subscription for backend services, data pipelines, and
-notebooks.
+Asyncio-first Python client SDK for [Sukko](https://github.com/sukko-dev/sukko) — realtime
+infrastructure proven correct under failure, deployed in your own cloud. Real-time market-data /
+event subscription for backend services, data pipelines, and notebooks.
 
 - **Async-iterator delivery** with capability-gated back-pressure — no unbounded buffering, no
   silent drops.

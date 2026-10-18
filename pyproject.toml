@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sukko"
 version = "0.1.0"
-description = "Asyncio-first Python client SDK for the Sukko real-time platform"
+description = "Asyncio-first Python client SDK for Sukko — realtime infra proven correct under failure, in your own cloud"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

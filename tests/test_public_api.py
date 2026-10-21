@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
+
 import sukko
 
 
@@ -17,7 +19,9 @@ def test_top_level_exports() -> None:
         parse_channel,
     )
 
-    assert sukko.__version__ == "0.1.0"
+    # __version__ must stay in sync with the packaged (pyproject) version, rather
+    # than a hardcoded literal that silently goes stale on every release bump.
+    assert sukko.__version__ == version("sukko")
     assert build_channel("acme", "trades") == "acme.trades"
     assert parse_channel("acme.trades") is not None
     assert ConnectionState.CONNECTED == "connected"

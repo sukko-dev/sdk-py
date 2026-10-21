@@ -56,7 +56,7 @@ from .transport.base import (
 from .transport.sse import SseTransport
 from .transport.websocket import WebSocketTransport
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # §V/§IX: the SDK is library-quiet (a NullHandler on the root `sukko` logger so nothing is emitted
 # unless the application configures logging) AND credential-safe. A logger's filters run only for

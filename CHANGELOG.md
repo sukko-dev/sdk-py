@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-21
+
+### Added
+- SSE reconnect-recovery control frames surfaced to clients (ADR-0006): `Gap`
+  (the wire gap event carrying the recovered range), `PossibleGap` (an
+  SDK-internal signal that a reconnect may have missed messages on a channel),
+  and `RecoveryInterruptedError`. These let callers detect and handle
+  message-loss windows across an SSE reconnect.
+
 ## [0.1.0] - 2026-10-04
 
 ### Added

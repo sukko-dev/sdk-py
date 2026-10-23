@@ -115,7 +115,10 @@ class WebSocketTransport:
         if self._conn is None:
             raise TransportError("send on a closed transport", retryable=False)
         try:
-            await self._conn.send(data)
+            # The Sukko WS protocol is JSON over TEXT frames. `websockets` sends a TEXT frame
+            # for a str and a BINARY frame for bytes, and the gateway ignores binary control
+            # frames — so decode the encoded message to a str to send it as text.
+            await self._conn.send(data.decode("utf-8"))
         except ConnectionClosed as exc:
             self._state = ConnectionState.DISCONNECTED
             code, reason, direction = self._close_details(exc)

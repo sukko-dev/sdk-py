@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- WebSocket transport now sends client frames as **TEXT**, not binary. `encode_client`
+  returns bytes and `websockets` sends bytes as a binary frame, which the gateway ignores —
+  so `subscribe`, WebSocket `publish`, and auth refresh silently had no effect against a real
+  gateway (REST publish was unaffected). Encoded frames are decoded to a `str` so they are
+  sent as TEXT frames.
+
 ## [0.1.1] - 2026-10-21
 
 ### Added

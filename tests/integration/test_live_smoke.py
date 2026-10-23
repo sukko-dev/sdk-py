@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable, Sequence
 
 import pytest
 
-from sukko import Message, SukkoClient, SyncSukkoClient
+from sukko import Message, SukkoClient, SyncSukkoClient, WebSocketTransport
 
 pytestmark = pytest.mark.integration
 
@@ -33,14 +34,21 @@ async def _first_on_channel(client: SukkoClient, channel: str) -> Message:
     raise AssertionError("stream ended before a message arrived")
 
 
+async def _wait_until(pred: Callable[[], bool], deadline: float, what: str) -> None:
+    """Poll pred() until true or the deadline — the SDK surfaces readiness as state, not events."""
+    end = time.monotonic() + deadline
+    while not pred():
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what} within {deadline}s")
+        await asyncio.sleep(0.05)
+
+
 async def _await_subscribed(client: SukkoClient, channel: str, deadline: float = 15.0) -> None:
     """Wait until the server has granted the subscription — race-free readiness before a
     publish. The SDK exposes no subscription-ack event, so poll the public granted set."""
-    end = time.monotonic() + deadline
-    while channel not in client.subscriptions:
-        if time.monotonic() > end:
-            raise AssertionError(f"not subscribed to {channel} within {deadline}s")
-        await asyncio.sleep(0.05)
+    await _wait_until(
+        lambda: channel in client.subscriptions, deadline, f"subscription to {channel}"
+    )
 
 
 async def test_async_subscribe_publish_receive_roundtrip(
@@ -64,6 +72,22 @@ def test_sync_lifecycle_and_publish(ws_url: str, token: str, channel: str) -> No
         client.rest_publish(channel, {"probe": "sync"})  # completes without raising
 
 
+async def test_api_key_auth(ws_url: str, api_key: str, token: str, channel: str) -> None:
+    """An API-key-authenticated client subscribes and receives — proving the gateway accepts
+    X-API-Key auth on the WebSocket path, not only JWTs. API keys are read-only (publish needs
+    a JWT), so a JWT client does the publish."""
+    ch = f"{channel}-apikey"
+    async with (
+        SukkoClient(ws_url, api_key=api_key) as subscriber,
+        SukkoClient(ws_url, token=token) as publisher,
+    ):
+        await subscriber.subscribe([ch])
+        await _await_subscribed(subscriber, ch)
+        await publisher.rest_publish(ch, {"probe": "apikey"})
+        msg = await asyncio.wait_for(_first_on_channel(subscriber, ch), timeout=_TIMEOUT)
+        assert msg.data.get("probe") == "apikey"
+
+
 async def test_push_vapid_key(ws_url: str, token: str, edition: str) -> None:
     """The push VAPID key round-trips (Web Push = Pro). Skipped unless the live stack is Pro+
     — on Community the push route is absent (404), so it is not exercised here."""
@@ -74,12 +98,69 @@ async def test_push_vapid_key(ws_url: str, token: str, edition: str) -> None:
         assert isinstance(key, str) and key
 
 
-@pytest.mark.skip(
-    reason="replay leg needs the harness to force a disconnect mid-stream (compose-driven)"
-)
-async def test_reconnect_with_replay() -> None:  # pragma: no cover
-    """After a forced disconnect the client reconnects and replays missed messages. Requires
-    the compose harness to sever the connection (e.g. kill the ws-server pod) — driven there."""
+async def test_reconnect_with_replay(ws_url: str, token: str, channel: str) -> None:
+    """Kafka gap→replay (no-loss recovery): messages published while the WebSocket is down are
+    replayed after reconnect. Only the WS is dropped — the gateway (hence REST) stays up. A
+    gated transport factory holds the reconnect closed so the publishes are guaranteed to land
+    while the client is offline, forcing the replay path."""
+    recovery_channel = f"{channel}-replay"
+    gate = asyncio.Event()
+    gate.set()  # the initial connect proceeds; cleared to hold a reconnect's open() closed
+    holder: dict[str, WebSocketTransport] = {}
+
+    def factory(channels: Sequence[str], resume: str | None) -> WebSocketTransport:
+        transport = WebSocketTransport(ws_url, token=token)
+        original_open = transport.open
+
+        async def gated_open() -> None:
+            await gate.wait()
+            await original_open()
+
+        transport.open = gated_open  # type: ignore[method-assign]
+        holder["t"] = transport
+        return transport
+
+    client = SukkoClient(ws_url, token=token, transport_factory=factory, reconnect_attempts=0)
+    received: list[Message] = []
+
+    async def collect() -> None:
+        async for item in client.messages():
+            if isinstance(item, Message) and item.channel == recovery_channel:
+                received.append(item)
+
+    await client.connect()
+    collector = asyncio.create_task(collect())
+    try:
+        await client.subscribe([recovery_channel])
+        await _await_subscribed(client, recovery_channel)
+
+        # A live message first — establishes the kafka pos cursor the resume replays from.
+        await client.rest_publish(recovery_channel, {"seq": 1})
+        await _wait_until(lambda: _has_seq(received, 1), 60.0, "first live message")
+        assert received[0].pos is not None, "kafka backend must attach a pos cursor"
+
+        # Drop ONLY the WS and hold the reconnect closed; publish while offline (REST via the
+        # still-up gateway). Kafka retains these for the resume.
+        gate.clear()
+        await holder["t"].close(1000)
+        await client.rest_publish(recovery_channel, {"seq": 2})
+        await client.rest_publish(recovery_channel, {"seq": 3})
+        gate.set()  # release the reconnect → the client resumes and replays seq 2 + 3
+
+        await _wait_until(
+            lambda: _has_seq(received, 2) and _has_seq(received, 3), 30.0, "replay of seq 2 + 3"
+        )
+    finally:
+        await client.close()
+        await collector
+
+    seqs = [m.data.get("seq") for m in received]
+    assert 2 in seqs and 3 in seqs, f"missed messages not replayed: {seqs}"
+    assert seqs.count(1) == 1, f"anchor message re-delivered (cursor not exclusive): {seqs}"
+
+
+def _has_seq(messages: list[Message], seq: int) -> bool:
+    return any(m.data.get("seq") == seq for m in messages)
 
 
 @pytest.mark.skip(reason="needs a short-lived token whose expiry the harness controls")

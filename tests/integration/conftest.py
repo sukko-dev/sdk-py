@@ -19,6 +19,7 @@ import pytest
 
 _WS_URL = os.environ.get("SUKKO_IT_WS_URL")
 _TOKEN = os.environ.get("SUKKO_IT_TOKEN")
+_API_KEY = os.environ.get("SUKKO_IT_API_KEY")
 _CHANNEL = os.environ.get("SUKKO_IT_CHANNEL", "sukko.it.smoke")
 # The stack's license edition, so edition-gated tests (Web Push = Pro) can skip when the
 # live stack does not provide them. Defaults to community.
@@ -55,3 +56,11 @@ def channel() -> str:
 def edition() -> str:
     """The live stack's license edition (community | pro | enterprise)."""
     return _EDITION
+
+
+@pytest.fixture
+def api_key() -> str:
+    """An API key for the tenant — skips if the harness did not provision one."""
+    if not _API_KEY:
+        pytest.skip("live API-key test needs SUKKO_IT_API_KEY")
+    return _API_KEY

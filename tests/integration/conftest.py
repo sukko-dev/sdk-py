@@ -20,6 +20,9 @@ import pytest
 _WS_URL = os.environ.get("SUKKO_IT_WS_URL")
 _TOKEN = os.environ.get("SUKKO_IT_TOKEN")
 _CHANNEL = os.environ.get("SUKKO_IT_CHANNEL", "sukko.it.smoke")
+# The stack's license edition, so edition-gated tests (Web Push = Pro) can skip when the
+# live stack does not provide them. Defaults to community.
+_EDITION = os.environ.get("SUKKO_IT_EDITION", "community")
 
 
 def _require_live() -> None:
@@ -46,3 +49,9 @@ def token() -> str:
 @pytest.fixture
 def channel() -> str:
     return _CHANNEL
+
+
+@pytest.fixture
+def edition() -> str:
+    """The live stack's license edition (community | pro | enterprise)."""
+    return _EDITION

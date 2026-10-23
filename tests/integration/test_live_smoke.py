@@ -21,7 +21,9 @@ from sukko import Message, SukkoClient, SyncSukkoClient
 
 pytestmark = pytest.mark.integration
 
-_TIMEOUT = 10.0
+# First delivery on a freshly-booted kafka topic (consumer joining from offset 0) can take
+# tens of seconds, so the live timeout is generous — a warm stack returns in well under a second.
+_TIMEOUT = 60.0
 
 
 async def _first_on_channel(client: SukkoClient, channel: str) -> Message:
@@ -31,13 +33,23 @@ async def _first_on_channel(client: SukkoClient, channel: str) -> Message:
     raise AssertionError("stream ended before a message arrived")
 
 
+async def _await_subscribed(client: SukkoClient, channel: str, deadline: float = 15.0) -> None:
+    """Wait until the server has granted the subscription — race-free readiness before a
+    publish. The SDK exposes no subscription-ack event, so poll the public granted set."""
+    end = time.monotonic() + deadline
+    while channel not in client.subscriptions:
+        if time.monotonic() > end:
+            raise AssertionError(f"not subscribed to {channel} within {deadline}s")
+        await asyncio.sleep(0.05)
+
+
 async def test_async_subscribe_publish_receive_roundtrip(
     ws_url: str, token: str, channel: str
 ) -> None:
     """Subscribe, REST-publish to the same channel, and receive it back."""
     async with SukkoClient(ws_url, token=token) as client:
         await client.subscribe([channel])
-        await asyncio.sleep(0.3)  # let the subscription settle server-side
+        await _await_subscribed(client, channel)  # race-free: wait for the server grant
         await client.rest_publish(channel, {"probe": "async"})  # REST publish (all editions)
         msg = await asyncio.wait_for(_first_on_channel(client, channel), timeout=_TIMEOUT)
         assert msg.data.get("probe") == "async"
@@ -52,8 +64,11 @@ def test_sync_lifecycle_and_publish(ws_url: str, token: str, channel: str) -> No
         client.rest_publish(channel, {"probe": "sync"})  # completes without raising
 
 
-async def test_push_vapid_key(ws_url: str, token: str) -> None:
-    """The push VAPID key round-trips (Web Push = Pro)."""
+async def test_push_vapid_key(ws_url: str, token: str, edition: str) -> None:
+    """The push VAPID key round-trips (Web Push = Pro). Skipped unless the live stack is Pro+
+    — on Community the push route is absent (404), so it is not exercised here."""
+    if edition not in ("pro", "enterprise"):
+        pytest.skip(f"Web Push is Pro-gated — stack edition is {edition}")
     async with SukkoClient(ws_url, token=token) as client:
         key = await client.push.get_vapid_key()
         assert isinstance(key, str) and key

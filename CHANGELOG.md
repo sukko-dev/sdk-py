@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-23
+
 ### Fixed
 - WebSocket transport now sends client frames as **TEXT**, not binary. `encode_client`
   returns bytes and `websockets` sends bytes as a binary frame, which the gateway ignores —

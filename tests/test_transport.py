@@ -180,3 +180,22 @@ async def test_sse_stream_end_raises_disconnect() -> None:
     with pytest.raises(ConnectionClosedError):
         await transport.recv()
     assert transport.state is ConnectionState.DISCONNECTED
+
+
+async def test_ws_send_uses_text_frame() -> None:
+    """The WS transport sends client frames over TEXT, not binary: it decodes the encoded
+    bytes to a str so `websockets` emits a TEXT frame. Regression — frames were sent as bytes
+    (a BINARY frame), which the gateway silently ignores, so subscribe/publish never worked."""
+    sent: list[object] = []
+
+    class _RecordingConn:
+        async def send(self, data: object) -> None:
+            sent.append(data)
+
+    transport = WebSocketTransport("wss://h/ws", token="t")
+    transport._conn = _RecordingConn()  # inject a connected conn, bypassing the network
+    await transport.send(b'{"type":"subscribe","data":{"channels":["acme.a"]}}')
+
+    assert len(sent) == 1
+    assert isinstance(sent[0], str), "must send a str so websockets uses a TEXT frame"
+    assert sent[0] == '{"type":"subscribe","data":{"channels":["acme.a"]}}'

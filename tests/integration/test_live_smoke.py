@@ -18,7 +18,15 @@ from collections.abc import Callable, Sequence
 
 import pytest
 
-from sukko import Message, SukkoClient, SyncSukkoClient, WebSocketTransport
+from sukko import (
+    ConnectionState,
+    Message,
+    SseTransport,
+    SukkoClient,
+    SyncSukkoClient,
+    Transport,
+    WebSocketTransport,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -86,6 +94,43 @@ async def test_api_key_auth(ws_url: str, api_key: str, token: str, channel: str)
         await publisher.rest_publish(ch, {"probe": "apikey"})
         msg = await asyncio.wait_for(_first_on_channel(subscriber, ch), timeout=_TIMEOUT)
         assert msg.data.get("probe") == "apikey"
+
+
+def _http_base(ws_url: str) -> str:
+    """The gateway's HTTP base for the SSE transport: ws(s)://host/ws → http(s)://host."""
+    base = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+    return base.removesuffix("/ws").rstrip("/")
+
+
+async def test_sse_subscribe_receive(ws_url: str, token: str, channel: str, edition: str) -> None:
+    """SSE subscribe→receive: a receive-only SSE subscriber gets a message published over WS.
+    SSE transport is Pro-gated (features.go SSETransport:Pro), so this skips unless the live
+    stack is Pro+ — on Community the SSE route is refused."""
+    if edition not in ("pro", "enterprise"):
+        pytest.skip(f"SSE transport is Pro-gated — stack edition is {edition}")
+    ch = f"{channel}-sse"
+    http_base = _http_base(ws_url)
+
+    def sse_factory(channels: Sequence[str], last_event_id: str | None) -> Transport:
+        # SSE channels are a connect-time subscription; the factory receives the desired set.
+        return SseTransport(http_base, list(channels), token=token, last_event_id=last_event_id)
+
+    # SSE needs its channels at connect time, so record the desired set via subscribe() BEFORE
+    # connect() (subscribe never auto-connects) — otherwise the factory builds SseTransport with
+    # no channels and raises. This is why the SSE subscriber isn't an auto-connecting `async with`.
+    subscriber = SukkoClient(ws_url, token=token, transport_factory=sse_factory)
+    try:
+        await subscriber.subscribe([ch])
+        await subscriber.connect()  # resolves once the SSE stream is live
+        await _wait_until(
+            lambda: subscriber.state is ConnectionState.CONNECTED, 15.0, "SSE stream connected"
+        )
+        async with SukkoClient(ws_url, token=token) as publisher:
+            await publisher.rest_publish(ch, {"probe": "sse"})
+            msg = await asyncio.wait_for(_first_on_channel(subscriber, ch), timeout=_TIMEOUT)
+        assert msg.data.get("probe") == "sse"
+    finally:
+        await subscriber.close()
 
 
 async def test_push_vapid_key(ws_url: str, token: str, edition: str) -> None:

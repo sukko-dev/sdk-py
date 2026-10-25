@@ -1,10 +1,10 @@
 """Live-compose smoke + wire-format — real gateway, real Kafka backend.
 
 Covers the cleanly-live-testable success criteria: async subscribe→receive, the sync wrapper,
-REST publish (all editions), and push VAPID (Pro Web Push). Reconnect-with-replay and
-mid-stream token refresh
-(auth refresh) need controlled disconnect / token-expiry injection the compose harness must drive —
-they are stubbed skip-with-reason below rather than silently omitted.
+REST publish (all editions), push VAPID (Pro Web Push), and reconnect-with-replay (kafka
+gap→replay, driven in-process by a gated transport — no harness disconnect needed). Only
+mid-stream token refresh (auth refresh) still needs token-expiry injection the compose harness
+must drive, so it is stubbed skip-with-reason below rather than silently omitted.
 
 Unlike the unit layer these use real time (short `wait_for` timeouts), which is correct for an
 end-to-end wire smoke.
